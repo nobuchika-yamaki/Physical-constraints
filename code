@@ -1,0 +1,197 @@
+"""
+Analysis pipeline for:
+Physical constraints shape neural connectomes
+
+This script reproduces all quantitative analyses reported in the paper:
+- preprocessing (log scaling + normalization)
+- non-reciprocity index chi
+- null-model rewiring (distance-preserving)
+- statistical moments (mean, std, kurtosis)
+- cycle density analysis
+- effective Hamiltonian and alpha sweep
+
+Figure plotting is intentionally excluded.
+"""
+
+import numpy as np
+import networkx as nx
+from scipy.stats import kurtosis
+from scipy.optimize import minimize_scalar
+
+# -----------------------------
+# 1. Preprocessing
+# -----------------------------
+
+def preprocess_weights(W_raw):
+    """
+    Log scaling and global flux normalization.
+    W_raw: raw weighted directed adjacency matrix
+    """
+    W_hat = np.log1p(W_raw)
+    flux = np.sum(W_hat)
+    if flux > 0:
+        W_hat = W_hat / flux
+    return W_hat
+
+
+# -----------------------------
+# 2. Non-reciprocity index chi
+# -----------------------------
+
+def compute_chi(W_hat, epsilon=1e-6):
+    """
+    Compute chi_ij for all unordered neuron pairs.
+    Returns 1D array of chi values.
+    """
+    n = W_hat.shape[0]
+    chi_vals = []
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            wij = W_hat[i, j]
+            wji = W_hat[j, i]
+            chi = abs(wij - wji) / (wij + wji + epsilon)
+            chi_vals.append(chi)
+
+    return np.array(chi_vals)
+
+
+# -----------------------------
+# 3. Summary statistics
+# -----------------------------
+
+def chi_statistics(chi_vals):
+    """
+    Mean, standard deviation, kurtosis (non-Fisher).
+    """
+    return {
+        "mean": float(np.mean(chi_vals)),
+        "std": float(np.std(chi_vals)),
+        "kurtosis": float(kurtosis(chi_vals, fisher=False))
+    }
+
+
+# -----------------------------
+# 4. Distance-preserving null model
+# -----------------------------
+
+def distance_preserving_rewire(W, coords, n_iter=10000, seed=0):
+    """
+    Distance-preserving directed rewiring.
+    Preserves in-degree, out-degree, and approximate distance distribution.
+    """
+    rng = np.random.default_rng(seed)
+    n = W.shape[0]
+
+    edges = [(i, j) for i in range(n) for j in range(n) if W[i, j] > 0]
+    distances = {
+        (i, j): np.linalg.norm(coords[i] - coords[j]) for (i, j) in edges
+    }
+
+    W_null = W.copy()
+
+    for _ in range(n_iter):
+        (i1, j1), (i2, j2) = rng.choice(edges, size=2, replace=False)
+
+        d1 = distances[(i1, j1)]
+        d2 = distances[(i2, j2)]
+        d1_new = np.linalg.norm(coords[i1] - coords[j2])
+        d2_new = np.linalg.norm(coords[i2] - coords[j1])
+
+        if abs(d1 - d1_new) + abs(d2 - d2_new) < abs(d1 - d2) + abs(d2 - d1):
+            w1 = W_null[i1, j1]
+            w2 = W_null[i2, j2]
+            W_null[i1, j1] = 0
+            W_null[i2, j2] = 0
+            W_null[i1, j2] = w1
+            W_null[i2, j1] = w2
+
+    return W_null
+
+
+# -----------------------------
+# 5. Cycle density analysis
+# -----------------------------
+
+def cycle_density(W, min_length=3):
+    """
+    Counts simple directed cycles >= min_length.
+    Normalized by number of nodes.
+    """
+    G = nx.from_numpy_array(W, create_using=nx.DiGraph)
+    cycles = list(nx.simple_cycles(G))
+    long_cycles = [c for c in cycles if len(c) >= min_length]
+    return len(long_cycles) / W.shape[0]
+
+
+# -----------------------------
+# 6. Effective Hamiltonian
+# -----------------------------
+
+def geometric_potential(chi):
+    # favors directionality
+    return 1.0 - chi
+
+def dissipative_potential(chi):
+    # information loss cost
+    return -np.log(1.0 - chi + 1e-9)
+
+def symmetry_potential(chi):
+    # electrical coupling restoring force
+    return chi**2
+
+def H_total(chi, alpha, beta, gamma):
+    return (
+        alpha * geometric_potential(chi)
+        + beta * dissipative_potential(chi)
+        + gamma * symmetry_potential(chi)
+    )
+
+
+# -----------------------------
+# 7. Equilibrium chi*
+# -----------------------------
+
+def equilibrium_chi(alpha, beta=1.0, gamma=1.0):
+    """
+    Returns chi* minimizing H(chi).
+    """
+    res = minimize_scalar(
+        H_total,
+        bounds=(0.0, 0.999),
+        args=(alpha, beta, gamma),
+        method="bounded"
+    )
+    return res.x
+
+
+def alpha_sweep(alpha_values, beta=1.0, gamma=1.0):
+    """
+    Computes equilibrium chi* over alpha range.
+    """
+    return np.array([equilibrium_chi(a, beta, gamma) for a in alpha_values])
+
+
+# -----------------------------
+# 8. Example execution wrapper
+# -----------------------------
+
+def run_analysis(W_raw, coords):
+    """
+    Full analysis for one connectome.
+    """
+    W_hat = preprocess_weights(W_raw)
+    chi_vals = compute_chi(W_hat)
+    stats = chi_statistics(chi_vals)
+    cycles = cycle_density(W_hat)
+
+    return {
+        "chi_values": chi_vals,
+        "statistics": stats,
+        "cycle_density": cycles
+    }
+
+
+# -----------------------------
+# End of file
+# -----------------------------
